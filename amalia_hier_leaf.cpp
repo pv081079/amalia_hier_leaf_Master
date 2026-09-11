@@ -2692,6 +2692,7 @@ int main(int argc,char **argv){
     int gen_pruned_leaves_mode=0;
     int block_search_mode=0;
     uint64_t rounds_per_block=UINT64_MAX;
+    uint64_t start_block=0;
     const char *output_leaves_file=nullptr;
     int preview_count=20;
     uint64_t gpl_start_b=0;
@@ -2733,6 +2734,7 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--range-hi")){ range_hi_hex=next(); }
         else if(!strcmp(argv[i],"--lanes")){ gpu_lanes=strtoull(next(),NULL,10); }
         else if(!strcmp(argv[i],"--gpus")){ num_gpus=atoi(next()); }
+        else if(!strcmp(argv[i],"--start-block")){ start_block=strtoull(next(),NULL,10); }
         else if(!strcmp(argv[i],"--master")){ master_mode=1; }
         else if(!strcmp(argv[i],"--master-port")){ master_port=atoi(next()); }
         else if(!strcmp(argv[i],"--master-timeout")){ master_timeout=atof(next()); }
@@ -3056,10 +3058,31 @@ int main(int argc,char **argv){
         TreeGenContext ctx;
         tree_gen_init(secp, ctx, root, tree_steps);
 
+        /* block_bits: log2(batch_size), only meaningful (and only used)
+           when --unsafe-prune is active and batch_size is a power of 2 -
+           lets block_fully_excluded_jump below skip an entire run of
+           blocks whose FIXED high-bit prefix alone already satisfies the
+           pruning rule, in O(1), instead of checking each one
+           individually via a real (if cheap) GPU dispatch. Matches
+           --block-search's own CPU-side jump exactly (same function,
+           same math) - added here after a real, reachable slowdown: a
+           multi-GPU --gpu-search run with pruning active checked blocks
+           one at a time near the start of a huge range, where small
+           sequential block numbers are near-certain to be trivially
+           excluded (their own binary representation has a long run of
+           leading zeros by construction) - without the jump, escaping
+           that region requires checking on the order of 2^(tree_steps-
+           block_bits-prune_repeat_n) blocks one by one, impractical even
+           at a fraction of a second each. */
+        int block_bits = -1;
+        if(g_unsafe_prune && batch_size>0 && (batch_size&(batch_size-1))==0){
+            block_bits = 0; uint64_t bs=batch_size; while(bs>1){ bs>>=1; block_bits++; }
+        }
+
         printf("[+] GPU search: tree_steps=%d, batch=%" PRIu64 " (%d GPU%s, blocks distributed round-robin)\n",
                tree_steps, batch_size, use_gpus, use_gpus>1?"s":"");
 
-        std::atomic<uint64_t> next_block_num{0};
+        std::atomic<uint64_t> next_block_num{start_block};
         std::atomic<bool> found{false};
         std::mutex result_mutex;
         std::string found_K;
@@ -3094,6 +3117,22 @@ int main(int argc,char **argv){
                     Int my_offset; my_offset.SetInt64((int64_t)my_block_num);
                     Int batch_size_i; batch_size_i.SetInt64((int64_t)batch_size);
                     my_offset.Mult(&batch_size_i);
+
+                    if(block_bits>=0){
+                        uint64_t jump = block_fully_excluded_jump(my_offset, tree_steps, g_prune_repeat_n, block_bits);
+                        if(jump>1){
+                            /* this block, and (jump-1) more after it, are
+                               ALL fully excluded by their shared fixed
+                               prefix alone - skip the rest without any
+                               GPU work, advancing the SHARED counter so
+                               other GPUs don't redundantly re-check the
+                               same doomed range. */
+                            next_block_num.fetch_add(jump-1, std::memory_order_relaxed);
+                            printf("[gpu-search] GPU %d block #%" PRIu64 " (offset=0x%s): fully excluded, "
+                                   "skipping %" PRIu64 " block(s)\n", g, my_block_num, my_offset.GetBase16(), jump);
+                            continue;
+                        }
+                    }
 
                     std::string my_K; uint64_t leaf_count=0;
                     double t0 = now_seconds();
