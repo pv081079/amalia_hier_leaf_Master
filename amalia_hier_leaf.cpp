@@ -3011,31 +3011,33 @@ int main(int argc,char **argv){
         int a_bits = root_bits - tree_steps;
         if(a_bits<1 || a_bits>45) die("root_bits - tree_steps must be between 1 and 45");
 
-        uint64_t max_block_count;   /* natural bound on block numbers, so a
-            multi-GPU (or any) dispatch loop stops claiming new blocks once
-            the b-space is exhausted, even without an explicit --max-batches -
-            confirmed as a real, reachable hang otherwise: with tree_steps=19
-            and --batch-size 524288 (exactly 2^19, one single valid block),
-            a second GPU under --gpus 2 would claim block #1 - an offset
-            already past the end of the entire b-space - with nothing to
-            stop it from doing so, or from claiming block #2, #3, ... after
-            that, since max_batches defaults to unbounded. */
+        /* The multi-GPU block dispatcher's own offset cursor (below) uses
+           an Int (arbitrary precision), not a uint64_t block number - a
+           uint64_t counter cannot represent the full range needed once
+           tree_steps-block_bits exceeds 64 (confirmed directly: a real
+           run at tree_steps=95 wrapped its uint64_t block counter around
+           after repeated maximal jumps, causing already-visited block
+           numbers to reappear). Its stopping condition compares the
+           cursor's own GetBitLength() against tree_steps directly,
+           needing no separately-computed 2^tree_steps value at all. */
         {
-            /* (uint64_t)1 << tree_steps is undefined behavior in C++ once
-               tree_steps >= 64 (this project supports tree_steps up to ~95
-               for large-root_bits scenarios) - cap explicitly rather than
-               shift by an out-of-range amount. */
-            uint64_t max_valid_batch = (tree_steps>=64) ? UINT64_MAX : ((uint64_t)1 << tree_steps);
-            if(batch_size > max_valid_batch){
-                fprintf(stderr, "ERROR: --batch-size %" PRIu64 " exceeds 2^tree_steps = %" PRIu64
-                        " - the total b-space for --tree-steps %d. A batch this large asks for leaves "
-                        "that cannot exist at this tree_steps, silently producing a WRONG K if allowed "
-                        "through (confirmed directly: reconstructed A comes out off by exactly one unit "
-                        "of M). Use --batch-size <= %" PRIu64 ".\n",
-                        batch_size, max_valid_batch, tree_steps, max_valid_batch);
-                exit(1);
+            /* batch_size is a uint64_t (< 2^64 always); once tree_steps>=64,
+               2^tree_steps >= 2^64 > any possible batch_size, so the check
+               only needs real arithmetic (avoiding any Int comparison
+               method) for tree_steps<64, where a plain uint64_t shift is
+               well-defined (no UB) and exact. */
+            if(tree_steps<64){
+                uint64_t max_valid_batch = (uint64_t)1 << tree_steps;
+                if(batch_size > max_valid_batch){
+                    fprintf(stderr, "ERROR: --batch-size %" PRIu64 " exceeds 2^tree_steps = %" PRIu64
+                            " - the total b-space for --tree-steps %d. A batch this large asks for leaves "
+                            "that cannot exist at this tree_steps, silently producing a WRONG K if allowed "
+                            "through (confirmed directly: reconstructed A comes out off by exactly one unit "
+                            "of M). Use --batch-size <= %" PRIu64 ".\n",
+                            batch_size, max_valid_batch, tree_steps, max_valid_batch);
+                    exit(1);
+                }
             }
-            max_block_count = (tree_steps>=64) ? UINT64_MAX : ((max_valid_batch + batch_size - 1) / batch_size);
         }
 
         int available_gpus = gpu_query_device_count();
@@ -3082,7 +3084,17 @@ int main(int argc,char **argv){
         printf("[+] GPU search: tree_steps=%d, batch=%" PRIu64 " (%d GPU%s, blocks distributed round-robin)\n",
                tree_steps, batch_size, use_gpus, use_gpus>1?"s":"");
 
-        std::atomic<uint64_t> next_block_num{start_block};
+        /* Shared cursor is an Int (arbitrary precision), not a uint64_t
+           block number - a uint64_t block counter cannot represent the
+           full range once tree_steps-block_bits exceeds 64, and silently
+           wraps around instead of stopping, confirmed directly at
+           tree_steps=95. */
+        Int cursor_offset;
+        { Int start_block_i; start_block_i.SetInt64((int64_t)start_block);
+          Int batch_size_i0; batch_size_i0.SetInt64((int64_t)batch_size);
+          cursor_offset.Set(&start_block_i); cursor_offset.Mult(&batch_size_i0); }
+        std::mutex cursor_mutex;
+        std::atomic<uint64_t> blocks_processed{0};
         std::atomic<bool> found{false};
         std::mutex result_mutex;
         std::string found_K;
@@ -3107,32 +3119,49 @@ int main(int argc,char **argv){
                 }
                 printf("[gpu-search] GPU %d: hierarchy ready.\n", g);
 
+                Int batch_size_i; batch_size_i.SetInt64((int64_t)batch_size);
+
                 while(!found.load(std::memory_order_relaxed)){
-                    if(max_batches>0 && next_block_num.load(std::memory_order_relaxed)>=(uint64_t)max_batches) break;
-                    if(next_block_num.load(std::memory_order_relaxed)>=max_block_count) break;
-                    uint64_t my_block_num = next_block_num.fetch_add(1, std::memory_order_relaxed);
-                    if(max_batches>0 && my_block_num>=(uint64_t)max_batches) break;
-                    if(my_block_num>=max_block_count) break;
-
-                    Int my_offset; my_offset.SetInt64((int64_t)my_block_num);
-                    Int batch_size_i; batch_size_i.SetInt64((int64_t)batch_size);
-                    my_offset.Mult(&batch_size_i);
-
-                    if(block_bits>=0){
-                        uint64_t jump = block_fully_excluded_jump(my_offset, tree_steps, g_prune_repeat_n, block_bits);
-                        if(jump>1){
-                            /* this block, and (jump-1) more after it, are
-                               ALL fully excluded by their shared fixed
-                               prefix alone - skip the rest without any
-                               GPU work, advancing the SHARED counter so
-                               other GPUs don't redundantly re-check the
-                               same doomed range. */
-                            next_block_num.fetch_add(jump-1, std::memory_order_relaxed);
-                            printf("[gpu-search] GPU %d block #%" PRIu64 " (offset=0x%s): fully excluded, "
-                                   "skipping %" PRIu64 " block(s)\n", g, my_block_num, my_offset.GetBase16(), jump);
-                            continue;
+                    Int my_offset;
+                    bool have_block = false;
+                    {
+                        std::lock_guard<std::mutex> lk(cursor_mutex);
+                        while(true){
+                            if(max_batches>0 && blocks_processed.load(std::memory_order_relaxed)>=(uint64_t)max_batches) break;
+                            /* cursor_offset >= 2^tree_steps  <=>  its bit
+                               length exceeds tree_steps (a number with
+                               bit_length B satisfies 2^(B-1)<=x<2^B, so
+                               bit_length>tree_steps already implies
+                               x>=2^tree_steps) - uses only GetBitLength(),
+                               already confirmed elsewhere in this file,
+                               rather than a Sub()+sign-check whose exact
+                               semantics on underflow aren't confirmed. */
+                            if(cursor_offset.GetBitLength() > tree_steps) break;
+                            my_offset.Set(&cursor_offset);
+                            if(block_bits>=0){
+                                uint64_t jump = block_fully_excluded_jump(my_offset, tree_steps, g_prune_repeat_n, block_bits);
+                                if(jump>1){
+                                    /* this block, and (jump-1) more after
+                                       it, are ALL fully excluded by their
+                                       shared fixed prefix alone - advance
+                                       the shared cursor past all of them
+                                       at once and keep looking, entirely
+                                       under the lock (cheap, no GPU work
+                                       involved) rather than doing this one
+                                       block at a time. */
+                                    Int jump_amount; jump_amount.SetInt64((int64_t)jump);
+                                    jump_amount.Mult(&batch_size_i);
+                                    cursor_offset.Add(&jump_amount);
+                                    continue;
+                                }
+                            }
+                            cursor_offset.Add(&batch_size_i);
+                            have_block = true;
+                            break;
                         }
                     }
+                    if(!have_block) break;
+                    blocks_processed.fetch_add(1, std::memory_order_relaxed);
 
                     std::string my_K; uint64_t leaf_count=0;
                     double t0 = now_seconds();
@@ -3140,8 +3169,8 @@ int main(int argc,char **argv){
                                                             my_offset, batch_size, restrict_upper_half!=0,
                                                             my_K, &leaf_count);
                     double dt = now_seconds()-t0;
-                    printf("[gpu-search] GPU %d block #%" PRIu64 " (offset=0x%s): %" PRIu64 " leaves, %.3fs, %s\n",
-                           g, my_block_num, my_offset.GetBase16(), leaf_count, dt, hit?"FOUND":"not found");
+                    printf("[gpu-search] GPU %d (offset=0x%s): %" PRIu64 " leaves, %.3fs, %s\n",
+                           g, my_offset.GetBase16(), leaf_count, dt, hit?"FOUND":"not found");
                     if(hit){
                         std::lock_guard<std::mutex> lk(result_mutex);
                         if(!have_result){ found_K = my_K; have_result=true; }
