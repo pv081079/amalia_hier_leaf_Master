@@ -1456,6 +1456,23 @@ static inline bool block_fully_excluded(Int &block_offset, int lv, int n, int bl
     return false;
 }
 
+/* Saturating add (caps at UINT64_MAX instead of wrapping) - for
+   display/--max-batches-limit counters that track how many blocks a
+   pruning jump has skipped. The REAL search cursor is always a
+   separate Int elsewhere (block_offset / cursor), unaffected by this;
+   these counters are cosmetic/limit-only, but a single jump can be up
+   to 2^60, and repeated large jumps at a low --prune-repeat-n can add
+   up to more than 2^64 in total, silently wrapping a plain uint64_t
+   counter back to a small value - confirmed as a real, reachable bug
+   (a GPU dispatcher's own equivalent counter wrapped and repeated
+   already-visited block numbers, before being replaced with an Int
+   cursor entirely; this file's other uint64_t skip-counters share the
+   same risk without needing the same full Int-cursor rewrite, since
+   they're display-only here). */
+static inline void sat_add_u64(uint64_t &acc, uint64_t add){
+    if(add > UINT64_MAX - acc) acc = UINT64_MAX; else acc += add;
+}
+
 static inline uint64_t block_fully_excluded_jump(Int &block_offset, int lv, int n, int block_bits){
     int best_j = -1;
     for(int i=block_bits; i+n<=lv; ++i){
@@ -1598,7 +1615,7 @@ static void run_master(const char *pubkey_hex, int tree_steps, int root_bits,
                 if(block_bits>=0){
                     uint64_t jump = block_fully_excluded_jump(cursor, tree_steps, prune_repeat_n, block_bits);
                     while(jump>0){
-                        blocks_skipped += jump;
+                        sat_add_u64(blocks_skipped, jump);
                         Int jump_amt; jump_amt.Set(&block_size_i); jump_amt.Mult(jump);
                         cursor.Add(&jump_amt);
                         jump = block_fully_excluded_jump(cursor, tree_steps, prune_repeat_n, block_bits);
@@ -3410,13 +3427,13 @@ int main(int argc,char **argv){
         double last_progress_print = now_seconds();
 
         while(true){
-            block_num++;
+            sat_add_u64(block_num, 1);
             uint64_t jump = block_bits>=0 ? block_fully_excluded_jump(block_offset, tree_steps, g_prune_repeat_n, block_bits) : 0;
             if(jump>0){
-                blocks_skipped_fully_excluded += jump;
+                sat_add_u64(blocks_skipped_fully_excluded, jump);
                 Int jump_amount; jump_amount.Set(&block_size_i); jump_amount.Mult(jump);
                 block_offset.Add(&jump_amount);
-                if(jump>1) block_num += (jump-1);
+                if(jump>1) sat_add_u64(block_num, jump-1);
                 double now = now_seconds();
                 if(now-last_progress_print>=2.0){
                     printf("[+] ...skipping fully-excluded blocks: %" PRIu64 " so far (block #%"
