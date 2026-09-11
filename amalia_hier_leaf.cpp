@@ -2910,6 +2910,7 @@ int main(int argc,char **argv){
 
             std::atomic<bool> found{false};
             std::atomic<uint64_t> total_checked{0};
+            std::atomic<int> active_workers{use_gpus};
             std::mutex result_mutex;
             uint64_t found_abs_i=0; int found_i2=-1, found_i3=-1, found_idx=-1;
             bool have_result=false;
@@ -2922,6 +2923,21 @@ int main(int argc,char **argv){
             std::vector<std::thread> workers;
             for(int g=0; g<use_gpus; ++g){
                 workers.emplace_back([&, g](){
+                    /* active_workers is decremented on EVERY exit path
+                       (RAII, so a return/break anywhere below still
+                       triggers it) - the polling loop below needs this,
+                       since std::thread::joinable() only means "not yet
+                       join()-ed", NOT "still running": a thread whose
+                       function already returned stays joinable() until
+                       actually joined, so checking it was a real,
+                       reachable bug - confirmed directly (both GPUs at
+                       0% utilization, meaning both worker lambdas had
+                       already finished, yet the main thread's own
+                       polling loop kept believing they were still alive
+                       forever, since it never actually joined until
+                       AFTER that same loop - a real deadlock, not a
+                       display glitch). */
+                    struct Dec { std::atomic<int> &c; ~Dec(){ c.fetch_sub(1, std::memory_order_relaxed); } } dec{active_workers};
                     if(!gpu_set_device(g)){
                         fprintf(stderr, "[gpu-scan] GPU %d: failed to select device, this worker will not contribute\n", g);
                         return;
@@ -2968,9 +2984,7 @@ int main(int argc,char **argv){
             uint64_t last_checked = 0;
             double displayed_mks = 0.0;
             while(!found.load(std::memory_order_relaxed)){
-                bool any_alive=false;
-                for(auto &w : workers) if(w.joinable()) any_alive=true;
-                if(!any_alive) break;
+                if(active_workers.load(std::memory_order_relaxed)<=0) break;
                 double now = now_seconds();
                 uint64_t tc = total_checked.load(std::memory_order_relaxed);
                 if(tc != last_checked){
