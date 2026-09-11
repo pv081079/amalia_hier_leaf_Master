@@ -1,3 +1,4 @@
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3008,8 +3009,21 @@ int main(int argc,char **argv){
         int a_bits = root_bits - tree_steps;
         if(a_bits<1 || a_bits>45) die("root_bits - tree_steps must be between 1 and 45");
 
+        uint64_t max_block_count;   /* natural bound on block numbers, so a
+            multi-GPU (or any) dispatch loop stops claiming new blocks once
+            the b-space is exhausted, even without an explicit --max-batches -
+            confirmed as a real, reachable hang otherwise: with tree_steps=19
+            and --batch-size 524288 (exactly 2^19, one single valid block),
+            a second GPU under --gpus 2 would claim block #1 - an offset
+            already past the end of the entire b-space - with nothing to
+            stop it from doing so, or from claiming block #2, #3, ... after
+            that, since max_batches defaults to unbounded. */
         {
-            uint64_t max_valid_batch = (uint64_t)1 << tree_steps;
+            /* (uint64_t)1 << tree_steps is undefined behavior in C++ once
+               tree_steps >= 64 (this project supports tree_steps up to ~95
+               for large-root_bits scenarios) - cap explicitly rather than
+               shift by an out-of-range amount. */
+            uint64_t max_valid_batch = (tree_steps>=64) ? UINT64_MAX : ((uint64_t)1 << tree_steps);
             if(batch_size > max_valid_batch){
                 fprintf(stderr, "ERROR: --batch-size %" PRIu64 " exceeds 2^tree_steps = %" PRIu64
                         " - the total b-space for --tree-steps %d. A batch this large asks for leaves "
@@ -3019,6 +3033,7 @@ int main(int argc,char **argv){
                         batch_size, max_valid_batch, tree_steps, max_valid_batch);
                 exit(1);
             }
+            max_block_count = (tree_steps>=64) ? UINT64_MAX : ((max_valid_batch + batch_size - 1) / batch_size);
         }
 
         int available_gpus = gpu_query_device_count();
@@ -3071,8 +3086,10 @@ int main(int argc,char **argv){
 
                 while(!found.load(std::memory_order_relaxed)){
                     if(max_batches>0 && next_block_num.load(std::memory_order_relaxed)>=(uint64_t)max_batches) break;
+                    if(next_block_num.load(std::memory_order_relaxed)>=max_block_count) break;
                     uint64_t my_block_num = next_block_num.fetch_add(1, std::memory_order_relaxed);
                     if(max_batches>0 && my_block_num>=(uint64_t)max_batches) break;
+                    if(my_block_num>=max_block_count) break;
 
                     Int my_offset; my_offset.SetInt64((int64_t)my_block_num);
                     Int batch_size_i; batch_size_i.SetInt64((int64_t)batch_size);
